@@ -19,6 +19,9 @@ logger = torch._logging.getArtifactLogger(__name__, "benchmarking")
 use_experimental_benchmarker = (
     inductor_config.use_experimental_benchmarker and torch.cuda.is_available()
 )
+use_torch_profiler_benchmarker = (
+    inductor_config.use_torch_profiler_benchmarker and torch.cuda.is_available()
+)
 
 
 MILLISECONDS_PER_SECOND = 1000
@@ -294,6 +297,160 @@ class TritonBenchmarker(Benchmarker):
         return self.triton_do_bench(_callable, **kwargs, return_mode="median")
 
 
+class TorchProfilerBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
+    """Benchmarker that uses torch.profiler for GPU kernel benchmarking."""
+
+    @time_and_count
+    def benchmark_gpu(  # type: ignore[override]
+        self: Self,
+        _callable: Callable[[], Any],
+        warmup: int = 25,
+        rep: int = 100,
+        return_mode: str = "mean",
+        grad_to_none: Optional[list[torch.Tensor]] = None,
+        **kwargs: Any,
+    ) -> float:
+        """Benchmark a GPU callable using torch.profiler.
+
+        Arguments:
+        - _callable: The callable to benchmark.
+
+        Keyword Arguments:
+        - warmup: Optionally, the number of warmup iterations to run before benchmarking.
+        - rep: Optionally, the number of iterations to run during benchmarking.
+        - return_mode: Return mode for benchmark results. Options are "min", "mean" (default),
+        or "max".
+        - grad_to_none: Optionally, a list of tensors whose gradients should be cleared
+        before each benchmark iteration.
+        - **kwargs: Additional kwargs that may be passed to the fallback.
+
+        Returns:
+        - The runtime of `_callable` in milliseconds, computed according to return_mode.
+        """
+        # we don't want any outside errors propagating into benchmarking
+        torch.cuda.synchronize()
+
+        # warmup `_callable` (and catches any failures in the process)
+        _callable()
+        torch.cuda.synchronize()
+
+        # create cache flush buffer: 256 MB = 256 * 1024 * 1024 bytes
+        # NOTE: This is the same buffer size as Triton's do_bench
+        # For AMD, there are better outcomes on short duration kernels (<20 us)
+        # when buffer size is set to the Infinity cache (LLC) instead of L2.
+        # LLC cache size is not a supported field in PyTorchdevice properties.
+        # see https://github.com/triton-lang/triton/pull/840 for why `dtype=torch.int`
+        buffer_size_bytes = 256 * 1024 * 1024
+        buffer = torch.empty(buffer_size_bytes // 4, dtype=torch.int, device="cuda")
+        buffer.zero_()
+
+        # additional warmup with cache flushing
+        for _ in range(warmup):
+            # Clear gradients before timing (matches triton.testing.do_bench)
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            buffer.zero_()
+            _callable()
+        torch.cuda.synchronize()
+
+        # benchmark with profiler
+        # Use both CPU and CUDA activities, otherwise record_function
+        # will not record the region.
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+        ) as prof:
+            for _ in range(rep):
+                # Clear gradients before timing (matches triton.testing.do_bench)
+                if grad_to_none is not None:
+                    for x in grad_to_none:
+                        x.grad = None
+                buffer.zero_()
+
+                with torch.profiler.record_function("_CALLABLE"):
+                    _callable()
+
+        torch.cuda.synchronize()
+
+        # record_function("_CALLABLE") produces a GPU_USER_ANNOTATION event
+        # (DeviceType.CUDA) whose device_time_total is the GPU wall-clock span
+        # of the annotated region (time_range.elapsed_us()), summed across all
+        # rep iterations. This closely matches what CUDA event timing measures
+        # and naturally captures inter-kernel gaps for multi-kernel callables.
+        callable_event = next(
+            (
+                event
+                for event in prof.key_averages()
+                if event.key == "_CALLABLE"
+                and event.device_type == torch.profiler.DeviceType.CUDA
+            ),
+            None,
+        )
+
+        assert callable_event is not None, (
+            "TorchProfilerBenchmarker: '_CALLABLE' CUDA event not found in "
+            "profiler output. This indicates record_function('_CALLABLE') did "
+            "not produce a GPU_USER_ANNOTATION profiler event."
+        )
+        callable_gpu_time_us = callable_event.device_time_total
+
+        # On HIP/ROCm, Triton kernels launch via hipModuleLaunchKernel (module
+        # API) while built-in ops like buffer.zero_() use hipLaunchKernel
+        # (runtime API), so filtering by _launch_kernel_keys naturally scopes
+        # to just the Triton kernel launches inside _CALLABLE.
+        # On CUDA this does NOT work reliably:
+        #   - If CUPTI driver API tracing is off (likely the default),
+        #     cuLaunchKernel events are absent and launch overhead is 0.
+        #   - If driver API tracing is on, cuLaunchKernel captures ALL launches
+        #     (including buffer.zero_()) because the runtime API calls through
+        #     to the driver API, breaking the scoping.
+        if inductor_config.triton.cudagraphs:
+            callable_time_launch_overhead_us = 0
+        else:
+            _launch_overhead_keys = {
+                "hipModuleLaunchKernel",
+                "hipExtModuleLaunchKernel",
+                "cuLaunchKernel",
+                "cuLaunchKernelEx",
+                "hipMemcpyAsync",
+                "cudaMemcpyAsync",
+                "cuMemcpyAsync",
+                "cuMemcpyDtoD",
+                "cuMemcpyDtoDAsync",
+            }
+            callable_time_launch_overhead_us = sum(
+                event.cpu_time_total
+                for event in prof.key_averages()
+                if event.device_type == torch.profiler.DeviceType.CPU
+                and event.key in _launch_overhead_keys
+            )
+
+        # GPU execution and CPU launch happen on overlapping timelines (the
+        # CPU launches asynchronously while the GPU executes), so adding them
+        # would double-count. Taking the max gives the true bottleneck: GPU
+        # time when GPU-bound, or launch overhead when launch-bound.
+        total_time_us = max(callable_gpu_time_us, callable_time_launch_overhead_us)
+        avg_time_ms = (total_time_us / rep) / 1000.0
+
+        # explicitly delete the buffer, sometimes helps memory
+        # footprint metrics in OSS Inductor performance benchmarks
+        del buffer
+
+        # Return based on the requested mode
+        # Note: For profiler-based benchmarking, we return the mean time per iteration
+        # min/max modes are kept for API compatibility but return the mean
+        if return_mode in ("min", "mean", "max"):
+            return avg_time_ms
+        else:
+            raise ValueError(
+                f"Unsupported return_mode: {return_mode}. Use 'min', 'mean', or 'max'."
+            )
+
+
 class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
     @cached_property
     def L2_cache_size(self: Self) -> int:
@@ -444,5 +601,9 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
 
 
 benchmarker = (
-    InductorBenchmarker() if use_experimental_benchmarker else TritonBenchmarker()
+    TorchProfilerBenchmarker()
+    if use_torch_profiler_benchmarker
+    else (
+        InductorBenchmarker() if use_experimental_benchmarker else TritonBenchmarker()
+    )
 )
