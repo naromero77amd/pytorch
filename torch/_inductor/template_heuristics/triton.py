@@ -1459,7 +1459,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             for num_warps in [4, 8]
             for group_m in [4, 8, 16]
             for matrix_instr_nonkdim in [0, 16]
-            for waves_per_eu in [0, 2]
+            for waves_per_eu in [0]
             for kpack in [2]
         ]
 
