@@ -2903,6 +2903,18 @@ def pointwise(
                                 num_warps=4,
                                 num_stages=4,  # 30% improvement
                             ),
+                            triton_config_with_settings(
+                                size_hints,
+                                32,
+                                num_warps=4,
+                                num_stages=1,  # 2.6x HRT improvement for fused_cat_leaky_relu_mul
+                            ),
+                            triton_config_with_settings(
+                                size_hints,
+                                8,
+                                num_warps=8,
+                                num_stages=1,  # 1.5x HRT improvement for fused_cat
+                            ),
                         ]
                     )
                 if inductor_meta.get("atomic_add_found"):
