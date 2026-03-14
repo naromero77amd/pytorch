@@ -2370,8 +2370,15 @@ def _check_max_grid_x(size_hints, x, num_warps):
     )  # TODO: query warp size once #129663 is merged
     num_blocks = (size_hints["x"] + x - 1) // x
 
+    # HIP < 7.2 has a 2^32 total-threads limit due to 32-bit arithmetic in CLR
+    # (see https://github.com/ROCm/rocm-systems/issues/2372).
+    # ROCm >= 7.2 and NVIDIA only need to check num_blocks against maxGridSize.
+    use_total_threads_check = False
     if torch.version.hip:
-        # HIP has a 2^31-1 limit on total threads (num_blocks * num_warps * warp_size)
+        hip_major, hip_minor = (int(v) for v in torch.version.hip.split(".")[:2])
+        use_total_threads_check = hip_major < 7 or (hip_major == 7 and hip_minor < 2)
+
+    if use_total_threads_check:
         while (
             (num_blocks * num_warps * warp_size) > max_grid_x
             and x < size_hints["x"]
@@ -2380,7 +2387,6 @@ def _check_max_grid_x(size_hints, x, num_warps):
             x *= 2
             num_blocks = num_blocks // 2
     else:
-        # NVIDIA has a 2^31-1 limit on number of blocks in grid (not total threads)
         while num_blocks > max_grid_x and x < size_hints["x"] and x < max_block_x:
             x *= 2
             num_blocks = num_blocks // 2
