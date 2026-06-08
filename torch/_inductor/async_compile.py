@@ -457,12 +457,16 @@ class AsyncCompile:
             # process pool is running, so pass them to the subprocess to reset.
             env_vars = [
                 "TORCHINDUCTOR_CACHE_DIR",
+                "TORCHINDUCTOR_COMPILE_ONLY_FAKE_ROCM_ARCH",
                 "TRITON_CACHE_DIR",
                 "TRITON_LIBDEVICE_PATH",
             ]
             extra_env = {v: os.environ[v] for v in env_vars if v in os.environ}
             extra_config = {
-                "use_static_triton_launcher": torch._inductor.config.use_static_triton_launcher
+                "compile_only_fake_rocm_arch": (
+                    torch._inductor.config.compile_only_fake_rocm_arch
+                ),
+                "use_static_triton_launcher": torch._inductor.config.use_static_triton_launcher,
             }
 
             if len(torch._inductor.config.autotune_lookup_table) > 0:
@@ -507,7 +511,7 @@ class AsyncCompile:
                 kernel.restore_after_unpickle(old_values=None)
 
                 kernel.precompile(
-                    warm_cache_only=False,
+                    warm_cache_only=bool(config.compile_only_fake_rocm_arch),
                     reload_kernel=reload_kernel_in_parent,
                     static_triton_bundle_key=CompiledTritonKernels.key(source_code),
                 )
@@ -533,7 +537,7 @@ class AsyncCompile:
                     kernel = load_kernel()
                     kernel.set_compile_info(compile_id, is_backward)
                     kernel.precompile(
-                        warm_cache_only=False,
+                        warm_cache_only=bool(config.compile_only_fake_rocm_arch),
                         static_triton_bundle_key=CompiledTritonKernels.key(source_code),
                     )
                     elapsed_us = (time_ns() - start_ns) // 1000

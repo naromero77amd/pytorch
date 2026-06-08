@@ -39,6 +39,24 @@ def native_matmul_persistent_rblock(r0_block: int) -> int:
     return max(r0_block, TRITON_DOT_MIN_BLOCK)
 
 
+def _rocm_arch_major(arch: str) -> int | None:
+    arch = arch.split(":", 1)[0]
+    if not arch.startswith("gfx"):
+        return None
+
+    digits = []
+    for char in arch[3:]:
+        if not char.isdigit():
+            break
+        digits.append(char)
+
+    if not digits:
+        return None
+    if len(digits) >= 3:
+        return int("".join(digits[:-2]))
+    return int(digits[0])
+
+
 class ReductionHint(Enum):
     INNER = 0
     OUTER = 1
@@ -172,11 +190,18 @@ class DeviceProperties(typing.NamedTuple):
     def create(cls, device) -> DeviceProperties:
         import torch
         from torch._dynamo.device_interface import get_interface_for_device
+        from torch._inductor import config
 
         device_type = device.type
 
         if torch.version.hip and device_type == "cuda":
             device_type = "hip"
+
+        fake_rocm_arch = None
+        if torch.version.hip:
+            fake_rocm_arch = config.compile_only_fake_rocm_arch
+            if fake_rocm_arch is not None:
+                fake_rocm_arch = fake_rocm_arch.split(":", 1)[0]
 
         device_interface = get_interface_for_device(device)
         props = device_interface.get_device_properties(device)
@@ -189,18 +214,27 @@ class DeviceProperties(typing.NamedTuple):
                 multi_processor_count = 64
             else:
                 raise
+        cc = device_interface.get_compute_capability(device)
+        major = getattr(props, "major", None)
+        warp_size = getattr(props, "warp_size", 32 if device_type != "cpu" else None)
+
+        if fake_rocm_arch:
+            cc = fake_rocm_arch
+            major = _rocm_arch_major(fake_rocm_arch) or major
+            warp_size = 64 if "gfx9" in fake_rocm_arch else 32
+
         return cls(
             type=device_type,
             index=device.index,
             multi_processor_count=multi_processor_count,
-            cc=device_interface.get_compute_capability(device),
-            major=getattr(props, "major", None),
+            cc=cc,
+            major=major,
             regs_per_multiprocessor=getattr(props, "regs_per_multiprocessor", None),
             max_threads_per_multi_processor=getattr(
                 props, "max_threads_per_multi_processor", None
             ),
             max_threads_per_block=getattr(props, "max_threads_per_block", 1024),
-            warp_size=getattr(props, "warp_size", 32 if device_type != "cpu" else None),
+            warp_size=warp_size,
         )
 
 

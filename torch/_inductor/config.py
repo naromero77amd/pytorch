@@ -565,6 +565,13 @@ triton_disable_device_detection = (
     os.environ.get("TORCHINDUCTOR_TRITON_DISABLE_DEVICE_DETECTION", "0") == "1"
 )
 
+# Debug-only: make Inductor-generated Triton kernels compile as if the ROCm
+# target architecture were this value, e.g. "gfx1250".  This is intended for
+# compile-only codegen inspection and should not be used for kernel execution.
+compile_only_fake_rocm_arch: str | None = os.environ.get(
+    "TORCHINDUCTOR_COMPILE_ONLY_FAKE_ROCM_ARCH"
+) or None
+
 # enable inductor graph partition to allow multiple inductor graphs for the same dynamo graph
 graph_partition: bool = (
     os.environ.get("TORCHINDUCTOR_GRAPH_PARTITION", "1" if not is_fbcode() else "0")
