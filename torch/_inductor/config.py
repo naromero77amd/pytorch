@@ -519,6 +519,12 @@ max_autotune_pointwise = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE") 
 # enable slow autotuning passes to select gemm algorithms
 max_autotune_gemm = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM") == "1"
 
+# Debug-only: run max-autotune choice generation and precompilation, but skip
+# benchmarking/executing candidates. Intended for compiler output inspection.
+max_autotune_compile_only = (
+    os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_COMPILE_ONLY", "0") == "1"
+)
+
 # When True, autotuning is spread across real kernel invocations instead of
 # blocking on the first call. Each run() call executes one config and records
 # timing via CUDA events, progressively eliminating underperforming configs.

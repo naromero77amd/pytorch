@@ -783,9 +783,13 @@ class TritonBenchmarkRequest(BenchmarkRequest):
             )
             self._benchmark_module = mod
             kernel = getattr(mod, self.kernel_name)
-            kernel.precompile()
+            compile_only = bool(
+                config.compile_only_fake_rocm_arch or config.max_autotune_compile_only
+            )
+            kernel.precompile(warm_cache_only=compile_only)
 
-            self.n_regs = kernel.launchers[0].n_regs
+            if not compile_only:
+                self.n_regs = kernel.launchers[0].n_regs
         finally:
             self.cleanup_run_fn()
 

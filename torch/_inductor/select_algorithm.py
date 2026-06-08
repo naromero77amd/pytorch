@@ -3237,7 +3237,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         assert self.bmreq is not None
         self.bmreq.precompile()
 
-        self.n_regs = self.bmreq.n_regs
+        self.n_regs = getattr(self.bmreq, "n_regs", None)
 
     def __str__(self) -> str:
         return f"TritonTemplateCaller({self.bmreq.module_path}, {self.description})"
@@ -3916,7 +3916,11 @@ class AlgorithmSelectorCache(PersistentCache):
             precompilation_timeout_seconds=precompilation_timeout_seconds,
         )
 
-        if return_multi_template and (config.max_autotune or config.max_autotune_gemm):
+        if (
+            return_multi_template
+            and (config.max_autotune or config.max_autotune_gemm)
+            and not config.max_autotune_compile_only
+        ):
             if use_pipelined_autotuning():
                 assert not config.benchmark_epilogue_fusion, (
                     "Benchmarking epilogues will cause gpu contention with pipelined autotuning"
@@ -4302,6 +4306,14 @@ class AlgorithmSelectorCache(PersistentCache):
             raise self.create_no_valid_choices(
                 name, "All choices failed to compile for backend."
             )
+
+        if config.max_autotune_compile_only:
+            log.info(
+                "Skipping autotune benchmarking for %s after precompiling %d choices",
+                name,
+                len(choices),
+            )
+            return {}
 
         candidates = self.prescreen_choices(
             choices, name, inputs_key, self.prescreening_cache

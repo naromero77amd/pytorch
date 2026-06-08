@@ -458,6 +458,7 @@ class AsyncCompile:
             env_vars = [
                 "TORCHINDUCTOR_CACHE_DIR",
                 "TORCHINDUCTOR_COMPILE_ONLY_FAKE_ROCM_ARCH",
+                "TORCHINDUCTOR_MAX_AUTOTUNE_COMPILE_ONLY",
                 "TRITON_CACHE_DIR",
                 "TRITON_LIBDEVICE_PATH",
             ]
@@ -465,6 +466,9 @@ class AsyncCompile:
             extra_config = {
                 "compile_only_fake_rocm_arch": (
                     torch._inductor.config.compile_only_fake_rocm_arch
+                ),
+                "max_autotune_compile_only": (
+                    torch._inductor.config.max_autotune_compile_only
                 ),
                 "use_static_triton_launcher": torch._inductor.config.use_static_triton_launcher,
             }
@@ -511,7 +515,10 @@ class AsyncCompile:
                 kernel.restore_after_unpickle(old_values=None)
 
                 kernel.precompile(
-                    warm_cache_only=bool(config.compile_only_fake_rocm_arch),
+                    warm_cache_only=bool(
+                        config.compile_only_fake_rocm_arch
+                        or config.max_autotune_compile_only
+                    ),
                     reload_kernel=reload_kernel_in_parent,
                     static_triton_bundle_key=CompiledTritonKernels.key(source_code),
                 )
@@ -537,7 +544,10 @@ class AsyncCompile:
                     kernel = load_kernel()
                     kernel.set_compile_info(compile_id, is_backward)
                     kernel.precompile(
-                        warm_cache_only=bool(config.compile_only_fake_rocm_arch),
+                        warm_cache_only=bool(
+                            config.compile_only_fake_rocm_arch
+                            or config.max_autotune_compile_only
+                        ),
                         static_triton_bundle_key=CompiledTritonKernels.key(source_code),
                     )
                     elapsed_us = (time_ns() - start_ns) // 1000
