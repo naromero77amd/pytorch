@@ -1,0 +1,83 @@
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+
+    if (M == 0) or (N == 0):
+        # early exit due to zero-size input(s)
+        return
+
+    start_pid = tl.program_id(0).to(INDEX_DTYPE)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = grid_m * grid_n
+    width = GROUP_M * grid_n
+
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+
+    # gfx1250 TDM: descriptor-based loads. On AMD's Triton backend, ops emitted
+    # from tensor descriptors (tt.descriptor_load) are lowered to the Tensor Data
+    # Mover async copies (amdgpu.async_tdm_copy_global_to_local) by the
+    # TritonAMDGPUConvertToTensorOps / StreamPipeliner passes. Plain tl.load does
+    # NOT lower to TDM, which is why this template uses descriptors explicitly.
+    a_desc = triton.language.make_tensor_descriptor(
+        base=A,
+        shape=[M, K] if A_ROW_MAJOR else [K, M],
+        strides=[stride_am, 1] if A_ROW_MAJOR else [stride_ak, 1],
+        block_shape=[BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+    )
+    b_desc = triton.language.make_tensor_descriptor(
+        base=B,
+        shape=[K, N] if B_ROW_MAJOR else [N, K],
+        strides=[stride_bk, 1] if B_ROW_MAJOR else [stride_bn, 1],
+        block_shape=[BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+    )
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+
+        # re-order program ID for better L2 performance
+        group_id = tile_id // width
+        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+        pid_m = group_id * GROUP_M + (tile_id % group_size)
+        pid_n = (tile_id % width) // (group_size)
+
+        rm = pid_m * BLOCK_M
+        rn = pid_n * BLOCK_N
+        rm_desc = rm.to(tl.int32)
+        rn_desc = rn.to(tl.int32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+
+        for rk in tl.range(0, K, BLOCK_K):
+            rk_desc = rk.to(tl.int32)
+
+            a = tl.load_tensor_descriptor(
+                a_desc,
+                [rm_desc, rk_desc] if A_ROW_MAJOR else [rk_desc, rm_desc],
+            )
+            b = tl.load_tensor_descriptor(
+                b_desc,
+                [rk_desc, rn_desc] if B_ROW_MAJOR else [rn_desc, rk_desc],
+            )
+            if USE_FAST_ACCUM:
+                acc = tl.dot(
+                    a if A_ROW_MAJOR else a.T,
+                    b if B_ROW_MAJOR else b.T,
+                    acc,
+                    allow_tf32=ALLOW_TF32,
+                    )
+            else:
+                acc += tl.dot(
+                    a if A_ROW_MAJOR else a.T,
+                    b if B_ROW_MAJOR else b.T,
+                    allow_tf32=ALLOW_TF32,
+                )
+
+        # rematerialize rm and rn to save registers
+        rm = pid_m * BLOCK_M
+        rn = pid_n * BLOCK_N
+
+        # inductor generates a suffix
+        {{store_output(("rm", "rn"), "acc", indent_width=8, val_shape=("BLOCK_M", "BLOCK_N"), block_indexing=True)}}

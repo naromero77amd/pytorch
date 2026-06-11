@@ -2254,6 +2254,92 @@ def use_triton_tma_template(
     return can_use_tma(*matrices, output_layout=layout, add_guards=add_guards)
 
 
+def is_gfx1250_arch(arch: str) -> bool:
+    return arch.split(":", 1)[0] == "gfx1250"
+
+
+_TDM_SUPPORTED_DTYPES = OrderedSet(
+    [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ]
+)
+
+
+def _gfx1250_tdm_enabled(device) -> bool:
+    if not torch.version.hip:
+        return False
+    if not config.enable_tdm_configs:
+        return False
+    if device is None or device.type != "cuda":
+        return False
+
+    fake_arch = config.compile_only_fake_rocm_arch
+    if fake_arch is not None:
+        if not is_gfx1250_arch(fake_arch):
+            return False
+    else:
+        try:
+            props = torch.cuda.get_device_properties(device)
+            arch = getattr(props, "gcnArchName", "")
+            if not is_gfx1250_arch(arch):
+                return False
+        except Exception:
+            return False
+
+    try:
+        import triton
+
+        from torch.torch_version import TorchVersion
+
+        if TorchVersion(triton.__version__) < "3.6.0":
+            return False
+    except ImportError:
+        return False
+
+    return True
+
+
+def use_triton_tdm_template(*matrices: IRNode, output_layout=None, add_guards=False):
+    device = matrices[0].get_device()
+    if not _gfx1250_tdm_enabled(device):
+        return False
+
+    from .virtualized import V
+
+    def _tdm_compatible(mat: IRNode) -> bool:
+        mat_dtype = mat.get_dtype()
+        if mat_dtype not in _TDM_SUPPORTED_DTYPES:
+            return False
+        sizes = mat.get_size()
+        strides = mat.get_stride()
+        if len(strides) != 2:
+            return False
+        dtype_bytes = mat_dtype.itemsize
+
+        def _known_eq(expr, val: int) -> bool:
+            return V.graph.sizevars.statically_known_equals(expr, val)
+
+        def _known_multiple(expr, val: int) -> bool:
+            return V.graph.sizevars.statically_known_multiple_of(expr, val)
+
+        inner = [i for i, st in enumerate(strides) if _known_eq(st, 1)]
+        if len(inner) != 1:
+            return False
+        inner_idx = inner[0]
+        outer_idx = 1 - inner_idx
+        if not _known_multiple(
+            strides[outer_idx] * dtype_bytes, config.tdm.alignment_bytes
+        ):
+            return False
+        if not _known_multiple(sizes[inner_idx] * dtype_bytes, config.tdm.alignment_bytes):
+            return False
+        return True
+
+    return all(_tdm_compatible(mat) for mat in matrices)
+
+
 def use_triton_blackwell_tma_template(
     *matrices: IRNode, output_layout: Layout, add_guards: bool = False
 ) -> bool:

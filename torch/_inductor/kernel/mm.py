@@ -55,6 +55,7 @@ from ..utils import (
     use_triton_scaling_template,
     use_triton_template,
     use_triton_tma_template,
+    use_triton_tdm_template,
 )
 from .mm_common import (
     _is_static_problem,
@@ -109,6 +110,12 @@ persistent_mm_template = TritonTemplate(
     source=load_kernel_template("triton_persistent_mm"),
 )
 
+persistent_tdm_mm_template = TritonTemplate(
+    name="mm_persistent_tdm",
+    grid=persistent_mm_grid,
+    source=load_kernel_template("triton_persistent_tdm_mm"),
+)
+
 
 scaled_mm_device_tma_epilogue_scaling_template = TritonTemplate(
     name="scaled_mm_device_tma_epilogue_scaling",
@@ -128,6 +135,29 @@ blackwell_ws_persistent_device_tma_mm_template = TritonTemplate(
     grid=persistent_mm_grid,
     source=load_kernel_template("triton_blackwell_ws_persistent_device_tma_mm"),
 )
+
+
+def _append_persistent_mm_template(
+    templates_to_use: list[ExternKernelChoice | KernelTemplate],
+    mat1: Buffer,
+    mat2: Buffer,
+    layout: Layout,
+) -> str | None:
+    if use_triton_blackwell_tma_template(
+        mat1, mat2, output_layout=layout, add_guards=True
+    ):
+        templates_to_use.append(blackwell_ws_persistent_device_tma_mm_template)
+        return "blackwell_tma"
+    if use_triton_tdm_template(mat1, mat2, output_layout=layout, add_guards=True):
+        templates_to_use.append(persistent_tdm_mm_template)
+        return "tdm"
+    if use_triton_tma_template(mat1, mat2, output_layout=layout, add_guards=True):
+        if torch.version.hip is None:
+            templates_to_use.append(persistent_tma_mm_template)
+        else:
+            templates_to_use.append(persistent_mm_template)
+        return "tma"
+    return None
 
 
 # prevent duplication registration of extern functions
@@ -427,17 +457,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         if is_exhaustive or not use_decompose_k_choice(m, n, k, threshold_multiple=2):
             templates_to_use.append(mm_template)
 
-            if use_triton_blackwell_tma_template(
-                mat1, mat2, output_layout=layout, add_guards=True
-            ):
-                templates_to_use.append(blackwell_ws_persistent_device_tma_mm_template)
-            elif use_triton_tma_template(
-                mat1, mat2, output_layout=layout, add_guards=True
-            ):
-                if torch.version.hip is None:
-                    templates_to_use.append(persistent_tma_mm_template)
-                else:
-                    templates_to_use.append(persistent_mm_template)
+            _append_persistent_mm_template(templates_to_use, mat1, mat2, layout)
 
         templates_to_use.append(mm_contiguous_subgraph_template)
 
@@ -687,15 +707,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
     if is_nonzero and use_triton_template(layout, check_max_autotune=False):
         templates_to_use.append(mm_template)
 
-        if use_triton_blackwell_tma_template(
-            mat1, mat2, output_layout=layout, add_guards=True
-        ):
-            templates_to_use.append(blackwell_ws_persistent_device_tma_mm_template)
-        elif use_triton_tma_template(mat1, mat2, output_layout=layout, add_guards=True):
-            if torch.version.hip is None:
-                templates_to_use.append(persistent_tma_mm_template)
-            else:
-                templates_to_use.append(persistent_mm_template)
+        _append_persistent_mm_template(templates_to_use, mat1, mat2, layout)
 
         # Manually call get_template_configs as use 1-D bias if possible
         choices.extend(

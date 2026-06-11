@@ -578,6 +578,10 @@ compile_only_fake_rocm_arch: str | None = os.environ.get(
     "TORCHINDUCTOR_COMPILE_ONLY_FAKE_ROCM_ARCH"
 ) or None
 
+# Debug/experimental: include gfx1250 TDM-specific template configs.  Real TDM
+# emission still requires a descriptor-based template selected by codegen.
+enable_tdm_configs = os.environ.get("TORCHINDUCTOR_ENABLE_TDM_CONFIGS", "0") == "1"
+
 # enable inductor graph partition to allow multiple inductor graphs for the same dynamo graph
 graph_partition: bool = (
     os.environ.get("TORCHINDUCTOR_GRAPH_PARTITION", "1" if not is_fbcode() else "0")
@@ -2673,6 +2677,12 @@ class rocm:
     # TORCHINDUCTOR_ORIGAMI_TOPK; defaults to 6 (sweet spot between compile
     # time and runtime within the validated 4-8 range).
     origami_topk: int = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_TOPK", "6"))
+
+
+class tdm:
+    max_outstanding_per_wave: int = 4
+    max_outstanding_per_simd: int = 6
+    alignment_bytes: int = 128
 
 
 # Backend to use for CPU codegen either "cpp" or "triton" (experimental) or "halide" (experimental) or "pallas" (experimental)

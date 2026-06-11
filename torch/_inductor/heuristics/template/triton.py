@@ -24,6 +24,7 @@ from ...kernel.mm import (
     get_tile_size,
     mm_template,
     persistent_mm_template,
+    persistent_tdm_mm_template,
     persistent_tma_mm_template,
     scaled_mm_device_tma_epilogue_scaling_template,
     scaled_mm_device_tma_main_loop_scaling_template,
@@ -58,6 +59,32 @@ log = logging.getLogger(__name__)
 def _origami_enabled() -> bool:
     """Check if origami GEMM optimization is enabled."""
     return config.rocm.origami
+
+
+def _is_gfx1250_device() -> bool:
+    if not torch.version.hip or not config.enable_tdm_configs:
+        return False
+
+    fake_arch = config.compile_only_fake_rocm_arch
+    if fake_arch is not None:
+        return fake_arch.split(":", 1)[0] == "gfx1250"
+
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", "")
+        return arch.split(":", 1)[0] == "gfx1250"
+    except Exception:
+        return False
+
+
+def _filter_tdm_block_k_configs(
+    configs: list[BaseConfig],
+    dtype_size: int,
+) -> list[BaseConfig]:
+    if dtype_size <= 0:
+        return configs
+    block_k_multiple = max(config.tdm.alignment_bytes // dtype_size, 1)
+    return [c for c in configs if c.block_k % block_k_multiple == 0]
 
 
 USE_META_WS = os.environ.get("TRITON_USE_META_WS", "0") == "0"
@@ -1533,6 +1560,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         super().__init__()
 
         self.default_num_stages = get_backend_num_stages()
+        self.uses_tdm_configs = False
 
         self.mm_configs: list[BaseConfig] = [
             ROCmGemmConfig(
@@ -1589,6 +1617,20 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             ROCmGemmConfig(256, 128, 32, self.default_num_stages, 8, group_m=16),
             ROCmGemmConfig(256, 128, 64, self.default_num_stages, 8, group_m=4),
             ROCmGemmConfig(256, 256, 64, self.default_num_stages, 8, group_m=4),
+        ]
+
+        self.tdm_persistent_mm_configs: list[BaseConfig] = [
+            ROCmGemmConfig(128, 64, 64, 4, 4, group_m=8, waves_per_eu=2),
+            ROCmGemmConfig(64, 128, 64, 4, 4, group_m=8, waves_per_eu=2),
+            ROCmGemmConfig(128, 64, 128, 4, 4, group_m=8),
+            ROCmGemmConfig(64, 128, 128, 4, 4, group_m=8),
+            ROCmGemmConfig(128, 128, 64, 4, 4, group_m=8),
+            ROCmGemmConfig(128, 128, 64, 4, 8, group_m=16),
+            ROCmGemmConfig(128, 128, 128, 4, 4, group_m=8),
+            ROCmGemmConfig(128, 128, 128, 3, 8, group_m=16),
+            ROCmGemmConfig(256, 128, 64, 4, 8, group_m=16),
+            ROCmGemmConfig(128, 256, 64, 4, 8, group_m=16),
+            ROCmGemmConfig(256, 128, 128, 3, 8, group_m=16),
         ]
 
         # Exhaustive search for mm configs
@@ -1738,12 +1780,49 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         ]
         return pruned_configs
 
+    def preprocess_mm_configs(
+        self,
+        m: int,
+        n: int,
+        k: int,
+        configs: list[BaseConfig],
+        has_int8_tensor: bool = False,
+        scale: float = 1.0,
+        exclude: Callable[
+            [sympy.Integer, sympy.Integer, sympy.Integer], bool
+        ] = lambda m, n, k: False,
+        dtype_size: int = 0,
+        op_name: str = "mm",
+        **kwargs,
+    ) -> Generator[TritonConfig, None, None]:
+        if self.uses_tdm_configs:
+            configs = _filter_tdm_block_k_configs(configs, dtype_size)
+        return super().preprocess_mm_configs(
+            m,
+            n,
+            k,
+            configs,
+            has_int8_tensor,
+            scale,
+            exclude,
+            dtype_size,
+            op_name,
+            **kwargs,
+        )
+
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
         """
         ROCm specific filtering
         """
+        tdm_enabled = self.uses_tdm_configs and _is_gfx1250_device()
+        max_stages = config.tdm.max_outstanding_per_wave
         for c in configs:
-            c.num_stages = self.default_num_stages
+            if tdm_enabled:
+                c.num_stages = (
+                    min(c.num_stages, max_stages) if c.num_stages > 1 else c.num_stages
+                )
+            else:
+                c.num_stages = self.default_num_stages
         return super()._filter_configs(configs)
 
     def _finalize_mm_configs(
@@ -2945,6 +3024,53 @@ class PersistentMMTemplateConfigHeuristic(
             kernel_inputs, op_name, **kwargs
         ):
             yield {**template_kwargs, "NUM_SMS": get_num_sms()}
+
+
+@register_template_heuristic(
+    persistent_tdm_mm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+)
+class ROCmPersistentTDMTemplateConfigHeuristic(
+    MMTemplateConfigMixin,
+    ROCmConfigHeuristic,  # type: ignore[misc]
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mm_configs = self.tdm_persistent_mm_configs
+        self.uses_tdm_configs = True
+
+    def _get_template_configs_impl(
+        self,
+        kernel_inputs: KernelInputs,
+        op_name: str,
+        **kwargs,
+    ) -> Generator[dict[str, Any], None, None]:
+        assert isinstance(kernel_inputs, MMKernelInputs), (
+            "ROCmPersistentTDMTemplateConfigHeuristic requires MMKernelInputs"
+        )
+        mat1, mat2 = kernel_inputs.mat1mat2()
+        tdm_opts = {
+            "A_ROW_MAJOR": not mat1.layout.is_transposed(),
+            "B_ROW_MAJOR": not mat2.layout.is_transposed(),
+            "NUM_SMS": get_num_sms(),
+        }
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name, **kwargs
+        ):
+            yield {**template_kwargs, **tdm_opts}
+
+
+@register_template_heuristic(
+    persistent_tdm_mm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class ROCmAddMMPersistentTDMTemplateConfigHeuristic(
+    AddMMConfigMixin, ROCmPersistentTDMTemplateConfigHeuristic
+):
+    pass
 
 
 @register_template_heuristic(
